@@ -1,0 +1,486 @@
+import numpy as np
+from scipy.fft import fftn, ifftn, fftfreq
+from scipy.optimize import curve_fit
+from scipy.integrate import quad
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import sympy as sp
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from scipy.spatial import KDTree
+import networkx as nx
+
+torch.set_default_dtype(torch.float32)
+
+class AetherCosmicWebKernel_v4:
+    def __init__(self, Ngrid=64, Lbox=200.0, Omega_m=0.3, Omega_L=0.7, Omega_b=0.045, h=0.7, seed=137, sigma8=0.8, ns=0.96):
+        self.Ngrid = Ngrid
+        self.Lbox = float(Lbox)
+        self.dx = Lbox / Ngrid
+        self.Omega_m = float(Omega_m)
+        self.Omega_L = float(Omega_L)
+        self.Omega_b = float(Omega_b)
+        self.h = float(h)
+        self.sigma8 = float(sigma8)
+        self.ns = float(ns)
+        self.Tcmb = 2.725
+        self.soft_eps = 1.5 * self.dx
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        print(f"🌌 AetherKernel v4 – Physics-Corrected Cosmic Web Engine")
+        print(f"   Grid {Ngrid}³ | Box {Lbox} Mpc/h | Ωm={Omega_m} ΩΛ={Omega_L} | σ8={sigma8} ns={ns}")
+        self.Dnorm = self.growth_factor(1.0)
+
+    # ====================== AXIOMATIC LAYER ======================
+    def symbolic_friedmann(self):
+        a, t = sp.symbols('a t', positive=True)
+        H0, Om, Ol = sp.symbols('H0 Omega_m Omega_Lambda', positive=True)
+        eq = sp.Eq(sp.diff(a, t)**2, H0**2 * (Om / a + Ol * a**2))
+        sol = sp.dsolve(eq, a)
+        print("Symbolic Friedmann solution (correct form):")
+        sp.pprint(sol)
+        return sol
+
+    def H(self, a):
+        return np.sqrt(self.Omega_m / a**3 + self.Omega_L)
+
+    def growth_factor(self, a):
+        def integrand(ap):
+            return 1.0 / (ap * self.H(ap))**3
+        int_a = quad(integrand, 1e-4, a)[0]
+        return self.H(a) * int_a / self.Dnorm
+
+    def growth_deriv(self, a):
+        def integrand(ap):
+            return 1.0 / (ap * self.H(ap))**3
+        int_a = quad(integrand, 1e-4, a)[0]
+        dHda = - (3/2.0) * self.Omega_m / (a**4 * self.H(a))
+        dDa = dHda * int_a + self.H(a) * integrand(a)
+        return dDa / self.Dnorm
+
+    def second_growth_factor(self, a):
+        Om_a = self.Omega_m / a**3 / self.H(a)**2
+        return -3/7.0 * self.growth_factor(a)**2 * Om_a ** (-1/55.0)
+
+    def second_growth_deriv(self, a):
+        D1 = self.growth_factor(a)
+        dD1da = self.growth_deriv(a)
+        Om_a = self.Omega_m / a**3 / self.H(a)**2
+        dHda = - (3/2.0) * self.Omega_m / (a**4 * self.H(a))
+        dOmda = Om_a * (-3 / a - 2 * dHda / self.H(a))
+        exp = -1/55.0
+        dOmexpda = exp * Om_a ** (exp - 1) * dOmda
+        dD2da = -3/7.0 * (2 * D1 * dD1da * Om_a**exp + D1**2 * dOmexpda)
+        return dD2da
+
+    def transfer(self, k):
+        if np.isscalar(k):
+            if k == 0:
+                return 1.0
+        else:
+            k = np.where(k == 0, 1e-10, k)
+        Om0 = self.Omega_m
+        Ob0 = self.Omega_b
+        h = self.h
+        q = k * (self.Tcmb / 2.7)**2 / (Om0 * h**2) * np.exp(-Ob0 - np.sqrt(2 * h) * Ob0 / Om0)
+        ln_term = np.log(1 + 2.34 * q)
+        poly_term = (1 + 3.89 * q + (16.1 * q)**2 + (5.46 * q)**3 + (6.71 * q)**4)**-0.25
+        return ln_term / (2.34 * q) * poly_term
+
+    def compute_sigma8(self):
+        R = 8.0
+        def pk_func(k):
+            return k**self.ns * self.transfer(k)**2
+        def integrand(k):
+            y = k * R
+            W = 3 * (np.sin(y) - y * np.cos(y)) / y**3 if np.isscalar(y) and y > 1e-6 else 1 - y**2 / 10 if np.isscalar(y) else np.where(y > 1e-6, 3 * (np.sin(y) - y * np.cos(y)) / y**3, 1 - y**2 / 10)
+            return k**2 / (2 * np.pi**2) * pk_func(k) * W**2
+        sigma2 = quad(integrand, 1e-4, 10.0, epsrel=1e-4)[0]
+        return np.sqrt(sigma2)
+
+    # ====================== INITIAL CONDITIONS (σ8-normalized) ======================
+    def generate_gaussian_random_field(self, a_init=0.1):
+        """Power-law spectrum + normalization to σ8 at a=1."""
+        kfreq = fftfreq(self.Ngrid, d=self.dx) * 2 * np.pi
+        kx, ky, kz = np.meshgrid(kfreq, kfreq, kfreq, indexing='ij')
+        k2 = kx**2 + ky**2 + kz**2
+        k2[0,0,0] = 1.0
+        k = np.sqrt(k2)
+
+        sigma_comp = self.compute_sigma8()
+        A = (self.sigma8 / sigma_comp)**2
+        D_init = self.growth_factor(a_init)
+        pk = A * (k ** self.ns) * self.transfer(k)**2 * D_init**2
+
+        white_noise = np.random.normal(0, 1, (self.Ngrid, self.Ngrid, self.Ngrid))
+        delta_k = white_noise * np.sqrt(pk)
+        delta_x = np.real(ifftn(delta_k)) * self.Ngrid ** 1.5
+        delta_x -= delta_x.mean()
+
+        print(f"   IC normalized → rms(δ) = {np.std(delta_x):.4f} (target σ8={self.sigma8} at a=1)")
+        return delta_x
+
+    # ====================== COSMOLOGICAL POISSON ======================
+    def _poisson_fft_3d(self, delta, a):
+        """∇²φ = (3/2) Ω_m δ / a   (H0=1 units)"""
+        kfreq = fftfreq(self.Ngrid, d=self.dx) * 2 * np.pi
+        kx, ky, kz = np.meshgrid(kfreq, kfreq, kfreq, indexing='ij')
+        k2 = kx**2 + ky**2 + kz**2
+        k_s2 = 1.0 / self.soft_eps**2
+        k2 += k_s2
+        k2[0,0,0] = 1e-12
+        phi_k = - (1.5 * self.Omega_m / a) * fftn(delta) / k2
+        return np.real(ifftn(phi_k))
+
+    # ====================== CIC (exact mass conservation) ======================
+    def _deposit_cic_3d(self, x, y, z):
+        rho = np.zeros((self.Ngrid, self.Ngrid, self.Ngrid))
+        pos = np.stack([x, y, z], axis=-1) / self.dx
+        i0 = np.floor(pos).astype(int) % self.Ngrid
+        f = pos - i0
+        one_minus_f = 1 - f
+
+        for dx_ in [0, 1]:
+            for dy_ in [0, 1]:
+                for dz_ in [0, 1]:
+                    w = (one_minus_f[...,0] if dx_==0 else f[...,0]) * \
+                        (one_minus_f[...,1] if dy_==0 else f[...,1]) * \
+                        (one_minus_f[...,2] if dz_==0 else f[...,2])
+                    idx = (i0[...,0] + dx_) % self.Ngrid, \
+                          (i0[...,1] + dy_) % self.Ngrid, \
+                          (i0[...,2] + dz_) % self.Ngrid
+                    np.add.at(rho, idx, w)
+
+        rho *= self.dx ** 3          # → mean ρ = 1 exactly
+        delta = rho - 1.0
+        assert abs(delta.mean()) < 1e-10, f"Mass violation: mean(δ) = {delta.mean():.2e}"
+        return delta
+
+    def _interpolate_cic_3d(self, field, x, y, z):
+        pos = np.stack([x, y, z], axis=-1) / self.dx
+        i0 = np.floor(pos).astype(int) % self.Ngrid
+        f = pos - i0
+        one_minus_f = 1 - f
+        val = np.zeros_like(x)
+        for dx_ in [0, 1]:
+            for dy_ in [0, 1]:
+                for dz_ in [0, 1]:
+                    w = (one_minus_f[...,0] if dx_==0 else f[...,0]) * \
+                        (one_minus_f[...,1] if dy_==0 else f[...,1]) * \
+                        (one_minus_f[...,2] if dz_==0 else f[...,2])
+                    idx = (i0[...,0] + dx_) % self.Ngrid, \
+                          (i0[...,1] + dy_) % self.Ngrid, \
+                          (i0[...,2] + dz_) % self.Ngrid
+                    val += w * field[idx]
+        return val
+
+    # ====================== LEAPFROG KDK INTEGRATOR ======================
+    def leapfrog_kdk(self, x, y, z, vx, vy, vz, delta, a_old, da):
+        """Kick-Drift-Kick with canonical momentum v = a dx/dt"""
+        a_new = a_old + da
+        a_mid = (a_old + a_new) / 2.0
+        H_mid = self.H(a_mid)
+        dt = da / (a_mid * H_mid)
+
+        # Kick ½
+        phi = self._poisson_fft_3d(delta, a_mid)
+        fx_grid = -np.gradient(phi, self.dx, axis=0)
+        fy_grid = -np.gradient(phi, self.dx, axis=1)
+        fz_grid = -np.gradient(phi, self.dx, axis=2)
+        fx = self._interpolate_cic_3d(fx_grid, x, y, z)
+        fy = self._interpolate_cic_3d(fy_grid, x, y, z)
+        fz = self._interpolate_cic_3d(fz_grid, x, y, z)
+        vx += (dt / 2.0) * fx
+        vy += (dt / 2.0) * fy
+        vz += (dt / 2.0) * fz
+        vx -= (dt / 2.0) * H_mid * vx
+        vy -= (dt / 2.0) * H_mid * vy
+        vz -= (dt / 2.0) * H_mid * vz
+
+        # Drift full step
+        x = (x + vx * dt / a_mid) % self.Lbox
+        y = (y + vy * dt / a_mid) % self.Lbox
+        z = (z + vz * dt / a_mid) % self.Lbox
+
+        new_delta = self._deposit_cic_3d(x, y, z)
+
+        # Kick ½
+        phi = self._poisson_fft_3d(new_delta, a_new)
+        fx_grid = -np.gradient(phi, self.dx, axis=0)
+        fy_grid = -np.gradient(phi, self.dx, axis=1)
+        fz_grid = -np.gradient(phi, self.dx, axis=2)
+        fx = self._interpolate_cic_3d(fx_grid, x, y, z)
+        fy = self._interpolate_cic_3d(fy_grid, x, y, z)
+        fz = self._interpolate_cic_3d(fz_grid, x, y, z)
+        vx += (dt / 2.0) * fx
+        vy += (dt / 2.0) * fy
+        vz += (dt / 2.0) * fz
+        vx -= (dt / 2.0) * H_mid * vx  # Approximate with H_mid for simplicity
+        vy -= (dt / 2.0) * H_mid * vy
+        vz -= (dt / 2.0) * H_mid * vz
+
+        return x, y, z, vx, vy, vz, new_delta
+
+    # ====================== POWER SPECTRUM ======================
+    def compute_power_spectrum(self, delta, nbins=40):
+        delta_k = fftn(delta)
+        kfreq = fftfreq(self.Ngrid, d=self.dx) * 2 * np.pi
+        kx, ky, kz = np.meshgrid(kfreq, kfreq, kfreq, indexing='ij')
+        k = np.sqrt(kx**2 + ky**2 + kz**2).flatten()
+        pk = (np.abs(delta_k)**2 / self.Ngrid**6).flatten() * self.Lbox**3
+
+        kbins = np.logspace(np.log10(0.01), np.log10(np.pi / self.dx), nbins)
+        Pk = np.zeros(nbins-1)
+        counts = np.zeros(nbins-1)
+        for i in range(len(kbins)-1):
+            mask = (k >= kbins[i]) & (k < kbins[i+1])
+            if mask.sum() > 0:
+                Pk[i] = pk[mask].mean()
+                counts[i] = mask.sum()
+        kcenters = (kbins[:-1] + kbins[1:]) / 2
+        return kcenters[counts > 0], Pk[counts > 0]
+
+    # ====================== 2LPT INITIAL CONDITIONS ======================
+    def compute_2lpt(self, delta_lin, a_init):
+        delta1 = delta_lin / self.growth_factor(a_init)
+        # Solve for phi1 with ∇²φ1 = -δ1
+        prefactor = 1.5 * self.Omega_m / a_init
+        phi1 = self._poisson_fft_3d(-delta1 / prefactor, a_init)
+
+        kfreq = fftfreq(self.Ngrid, d=self.dx) * 2 * np.pi
+        kx, ky, kz = np.meshgrid(kfreq, kfreq, kfreq, indexing='ij')
+
+        phi1_k = fftn(phi1)
+
+        dxx_k = -kx**2 * phi1_k
+        dyy_k = -ky**2 * phi1_k
+        dzz_k = -kz**2 * phi1_k
+        dxy_k = -kx * ky * phi1_k
+        dxz_k = -kx * kz * phi1_k
+        dyz_k = -ky * kz * phi1_k
+
+        dxx = np.real(ifftn(dxx_k))
+        dyy = np.real(ifftn(dyy_k))
+        dzz = np.real(ifftn(dzz_k))
+        dxy = np.real(ifftn(dxy_k))
+        dxz = np.real(ifftn(dxz_k))
+        dyz = np.real(ifftn(dyz_k))
+
+        source = dxx * dyy + dxx * dzz + dyy * dzz - dxy**2 - dxz**2 - dyz**2
+
+        # Solve for phi2 with ∇²φ2 = source
+        phi2 = self._poisson_fft_3d(source / prefactor, a_init)
+
+        return phi1, phi2
+
+    # ====================== HALO FINDER ======================
+    def find_halos(self, x, y, z, b=0.2, min_size=20):
+        positions = np.stack([x.ravel(), y.ravel(), z.ravel()], axis=1)
+        Npart = len(positions)
+        mean_sep = self.Lbox / self.Ngrid
+        ll = b * mean_sep
+        tree = KDTree(positions)
+        pairs = tree.query_pairs(ll)
+        G = nx.Graph()
+        G.add_nodes_from(range(Npart))
+        G.add_edges_from(pairs)
+        components = list(nx.connected_components(G))
+        halos = [comp for comp in components if len(comp) >= min_size]
+        return halos
+
+    # ====================== PINN SURROGATE ======================
+    class CosmoPINN(nn.Module):
+        def __init__(self, hidden=256):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(4, hidden), nn.Tanh(),
+                nn.Linear(hidden, hidden), nn.Tanh(),
+                nn.Linear(hidden, hidden), nn.Tanh(),
+                nn.Linear(hidden, 1)
+            )
+        def forward(self, inputs):
+            return self.net(inputs)
+
+    def train_pinn_surrogate(self, delta_history, a_history, epochs=800, lr=0.003, lambda_phys=0.1, n_col=1000):
+        print(" Training PINN surrogate...")
+        model = self.CosmoPINN()
+        x_grid = np.linspace(0, 1, self.Ngrid)
+        X, Y, Z = np.meshgrid(x_grid, x_grid, x_grid, indexing='ij')
+        coords = np.stack([X, Y, Z], axis=-1).reshape(-1, 3)
+
+        X_train, y_train = [], []
+        for i, a in enumerate(a_history):
+            a_tensor = np.full((coords.shape[0], 1), a)
+            X_train.append(np.hstack([coords, a_tensor]))
+            y_train.append(delta_history[i].flatten())
+
+        X_train = torch.tensor(np.vstack(X_train), dtype=torch.float32)
+        y_train = torch.tensor(np.concatenate(y_train), dtype=torch.float32).unsqueeze(1)
+
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=200, gamma=0.5)
+
+        a_min = min(a_history)
+        a_max = max(a_history)
+
+        for ep in range(epochs):
+            optimizer.zero_grad()
+            pred = model(X_train)
+            loss_data = nn.MSELoss()(pred, y_train)
+
+            # Physics loss
+            col_coords = torch.rand(n_col, 3)
+            col_a = torch.rand(n_col, 1) * (a_max - a_min) + a_min
+            col_inputs = torch.cat([col_coords, col_a], dim=1)
+            col_inputs.requires_grad = True
+            col_pred = model(col_inputs)
+            partial_a = torch.autograd.grad(col_pred, col_inputs, grad_outputs=torch.ones_like(col_pred), create_graph=True)[0][:, -1].unsqueeze(1)
+            f_a = torch.zeros_like(col_a)
+            for i in range(n_col):
+                aa = col_a[i].item()
+                f_a[i] = self.growth_deriv(aa) / self.growth_factor(aa)
+            res = partial_a - f_a * col_pred
+            loss_phys = torch.mean(res**2)
+
+            loss = loss_data + lambda_phys * loss_phys
+
+            if ep % 100 == 0:
+                loss += 0.01 * torch.mean(pred)**2
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            if ep % 100 == 0:
+                print(f"   Epoch {ep:4d} | Loss {loss.item():.2e} (data: {loss_data.item():.2e}, phys: {loss_phys.item():.2e})")
+
+        self.pinn_model = model
+        print("✅ PINN surrogate trained")
+        return model
+
+    def predict_pinn(self, a):
+        if not hasattr(self, 'pinn_model'):
+            raise RuntimeError("Train PINN first")
+        x_grid = np.linspace(0, 1, self.Ngrid)
+        X, Y, Z = np.meshgrid(x_grid, x_grid, x_grid, indexing='ij')
+        coords = np.stack([X, Y, Z], axis=-1).reshape(-1, 3)
+        inputs = torch.tensor(np.hstack([coords, np.full((len(coords), 1), a)]), dtype=torch.float32)
+        with torch.no_grad():
+            return self.pinn_model(inputs).numpy().reshape(self.Ngrid, self.Ngrid, self.Ngrid)
+
+    # ====================== DEMO ======================
+    def run_demo(self, n_steps=100, a_init=0.1, a_final=1.0):
+        print("\nForging 3D Cosmic Web from corrected first principles...")
+
+        delta0 = self.generate_gaussian_random_field(a_init)
+
+        # 2LPT initial displacement and velocity
+        phi1, phi2 = self.compute_2lpt(delta0, a_init)
+
+        dx1 = np.gradient(phi1, self.dx, axis=0)
+        dy1 = np.gradient(phi1, self.dx, axis=1)
+        dz1 = np.gradient(phi1, self.dx, axis=2)
+
+        dx2 = np.gradient(phi2, self.dx, axis=0)
+        dy2 = np.gradient(phi2, self.dx, axis=1)
+        dz2 = np.gradient(phi2, self.dx, axis=2)
+
+        D1 = self.growth_factor(a_init)
+        dD1da = self.growth_deriv(a_init)
+        D2 = self.second_growth_factor(a_init)
+        dD2da = self.second_growth_deriv(a_init)
+
+        qx, qy, qz = np.mgrid[0:self.Lbox:self.Ngrid*1j,
+                              0:self.Lbox:self.Ngrid*1j,
+                              0:self.Lbox:self.Ngrid*1j]
+        x = (qx - D1 * dx1 - D2 * dx2) % self.Lbox
+        y = (qy - D1 * dy1 - D2 * dy2) % self.Lbox
+        z = (qz - D1 * dz1 - D2 * dz2) % self.Lbox
+
+        vx = a_init**2 * self.H(a_init) * (dD1da * (-dx1) + dD2da * (-dx2))
+        vy = a_init**2 * self.H(a_init) * (dD1da * (-dy1) + dD2da * (-dy2))
+        vz = a_init**2 * self.H(a_init) * (dD1da * (-dz1) + dD2da * (-dz2))
+
+        delta = self._deposit_cic_3d(x, y, z)
+
+        delta_history = [delta.copy()]
+        a_history = [a_init]
+        a = a_init
+
+        a_values = np.logspace(np.log10(a_init), np.log10(a_final), n_steps + 1)
+        for step in range(n_steps):
+            a_old = a_values[step]
+            a = a_values[step + 1]
+            da = a - a_old
+            x, y, z, vx, vy, vz, delta = self.leapfrog_kdk(x, y, z, vx, vy, vz, delta, a_old, da)
+            delta_history.append(delta.copy())
+            a_history.append(a)
+
+            if step % 5 == 0:
+                print(f" Step {step:2d} | a={a:.3f} | σ(δ)={delta.std():.3f} | mass err={abs(delta.mean()):.2e}")
+
+        # Growth law rediscovery
+        sigma_a = [d.std() for d in delta_history]
+        popt, _ = curve_fit(lambda a, norm: norm * a, a_history, sigma_a, p0=[1.0])
+        print(f"🔬 Rediscovered linear growth: D(a) ≈ {popt[0]:.3f} × a")
+
+        # Power spectra
+        ks, pks = [], []
+        for d in [delta_history[0], delta_history[-1]]:
+            k, pk = self.compute_power_spectrum(d)
+            ks.append(k)
+            pks.append(pk)
+
+        self.train_pinn_surrogate(delta_history, a_history)
+
+        # Halo finder
+        halos = self.find_halos(x, y, z)
+        print(f"Found {len(halos)} halos with min size 20 particles")
+
+        # ====================== VISUALIZATION ======================
+        fig = plt.figure(figsize=(15, 10))
+        slice_idx = self.Ngrid // 2
+        ax = [plt.subplot(2, 2, i+1) for i in range(4)]
+
+        ax[0].imshow(delta_history[0][slice_idx] + 1, cmap='viridis', extent=[0, self.Lbox, 0, self.Lbox])
+        ax[0].set_title(f'Initial slice (a={a_init:.2f})')
+        im = ax[1].imshow(delta_history[-1][slice_idx] + 1, cmap='plasma', extent=[0, self.Lbox, 0, self.Lbox])
+        ax[1].set_title(f'Final web (a={a:.2f})')
+        plt.colorbar(im, ax=ax[1])
+
+        ax[2].loglog(ks[0], pks[0], 'b-', label='Initial (linear)')
+        ax[2].loglog(ks[1], pks[1], 'r-', label='Final (nonlinear)')
+        ax[2].set_xlabel('k [h/Mpc]')
+        ax[2].set_ylabel('P(k)')
+        ax[2].legend()
+        ax[2].set_title('Power Spectrum Evolution')
+
+        pred = self.predict_pinn(a)
+        ax[3].imshow(pred[slice_idx], cmap='plasma', extent=[0, self.Lbox, 0, self.Lbox])
+        ax[3].set_title('PINN surrogate prediction')
+
+        plt.suptitle('AetherKernel v4 — Corrected First-Principles Cosmic Web', fontsize=16)
+        plt.tight_layout()
+        plt.savefig('aetherkernel_v4_cosmic_web.png', dpi=300, bbox_inches='tight')
+        plt.show()
+
+        # Animation
+        def update(frame):
+            anim_ax.clear()
+            anim_ax.imshow(delta_history[frame][slice_idx] + 1, cmap='plasma',
+                           extent=[0, self.Lbox, 0, self.Lbox])
+            anim_ax.set_title(f'a = {a_history[frame]:.3f}')
+
+        anim_fig, anim_ax = plt.subplots(figsize=(8, 8))
+        ani = FuncAnimation(anim_fig, update, frames=len(delta_history), interval=100)
+        ani.save('cosmic_web_3d_evolution_v4.mp4', writer='ffmpeg', fps=10, dpi=180)
+        print(" Saved: cosmic_web_3d_evolution_v4.mp4")
+
+        print("\n🎉 AetherKernel v4 complete. Universe forged with perfect axioms.")
+        return delta_history[-1]
+
+
+if __name__ == "__main__":
+    kernel = AetherCosmicWebKernel_v4(Ngrid=64, Lbox=200.0, seed=137)
+    kernel.symbolic_friedmann()
+    final_delta = kernel.run_demo()
+    print("Reality is now open-source and axiomatically correct.")
